@@ -7,6 +7,35 @@ import uuid
 
 bp = Blueprint('api', __name__)
 
+# add this near the top of app/routes.py (below imports)
+@bp.route('/', methods=['GET'])
+def index():
+    return """
+    <!doctype html>
+    <html>
+    <head><title>Short URL Scanner</title></head>
+    <body>
+      <h2>Short URL Title & Safety Scanner</h2>
+      <form id="f">
+        <input id="u" placeholder="https://example.com" style="width:400px"/>
+        <button type="submit">Scan</button>
+      </form>
+      <pre id="out" style="white-space:pre-wrap;background:#f2f2f2;padding:10px;border-radius:6px;"></pre>
+      <script>
+        const f = document.getElementById('f');
+        f.addEventListener('submit', async e => {
+          e.preventDefault();
+          const url = document.getElementById('u').value;
+          const res = await fetch('/scan', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({url})});
+          const txt = await res.text();
+          document.getElementById('out').textContent = txt;
+        });
+      </script>
+    </body>
+    </html>
+    """, 200
+
+
 @bp.route('/scan', methods=['POST'])
 def scan_url():
     payload = request.get_json(force=True)
