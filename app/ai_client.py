@@ -68,97 +68,112 @@ def _parse_model_response_text(text: str) -> Optional[Tuple[float, str, str]]:
 
 def _call_remote_model_generate_content(url: str, page_text: str) -> Optional[Tuple[float, str, str]]:
     """
-    Call v1beta generateContent (Gemini) and try to parse a JSON blob from the candidate text.
-    Returns (score, label, explanation) or None.
+    Gemini v1beta generateContent client with:
+      - 3 retries
+      - escalating prompt strictness
+      - structured logs
+      - graceful fallback
+    
+    Returns: (score, label, explanation) or None
     """
+
     if not LLM_API_URL or not GEMINI_API_KEY:
         raise RuntimeError("Remote LLM configured but LLM_API_URL or GEMINI_API_KEY missing")
 
-    prompt_text = (
-        "You are a URL safety assistant. Return EXACTLY one valid JSON object and nothing else, with fields: "
+    # --- prompt variants for retry escalation ---
+    base_prompt = (
+        "You are a URL safety assistant. Return EXACTLY one valid JSON object with fields: "
         "score (0.0-1.0), label (low_risk|medium_risk|high_risk), explanation (short). "
         "Example: {\"score\":0.12,\"label\":\"low_risk\",\"explanation\":\"domain safe\"}\n\n"
         f"URL: {url}\n\nPAGE_SNIPPET: {(page_text or '')[:1200]}\n\nJSON:"
     )
 
-    body = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [
-                    {"text": prompt_text}
-                ]
-            }
-        ]
-    }
+    strict_prompt = base_prompt + "\nReturn STRICT JSON ONLY. No extra text."
 
-    headers = {
-        "x-goog-api-key": GEMINI_API_KEY,
-        "Content-Type": "application/json",
-    }
+    minimal_prompt = (
+        "Return ONLY valid JSON like: "
+        "{\"score\":0.1,\"label\":\"low_risk\",\"explanation\":\"short\"} "
+        f"for URL={url}."
+    )
 
-    try:
-        resp = requests.post(LLM_API_URL, json=body, headers=headers, timeout=25)
-    except Exception as e:
-        logger.exception("HTTP request to LLM endpoint failed: %s", e)
-        raise
+    prompt_attempts = [base_prompt, strict_prompt, minimal_prompt]
 
-    # record status for debugging
-    status = resp.status_code
-    text = resp.text or ""
-    logger.info("LLM response status=%s length=%d", status, len(text))
+    # --- Try all escalating prompts ---
+    for attempt_idx, prompt_text in enumerate(prompt_attempts, start=1):
+        logger.info(f"AI safety: Attempt {attempt_idx}/3 using Gemini endpoint: {LLM_API_URL}")
 
-    if status != 200:
-        # log body for debugging, but avoid logging keys; safe because resp is model result not secret
-        logger.warning("LLM non-200 response: %s ; body=%s", status, text[:1000])
-        # raise an HTTPError so outer caller can treat as failure and fallback
-        resp.raise_for_status()
+        body = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": prompt_text}]
+                }
+            ]
+        }
 
-    # parse expected candidate shape
-    try:
-        data = resp.json()
-    except Exception:
-        # if not JSON at top-level, try to parse text for a JSON blob
-        logger.debug("LLM top-level JSON parse failed; trying to parse response text")
-        parsed = _parse_model_response_text(text)
-        if parsed:
-            return parsed
-        logger.warning("LLM returned non-JSON and no parseable JSON found in text.")
-        return None
+        headers = {
+            "x-goog-api-key": GEMINI_API_KEY,
+            "Content-Type": "application/json",
+        }
 
-    candidates = data.get("candidates") or []
-    if not candidates:
-        logger.debug("LLM response contains no candidates; raw=%s", text[:800])
-        # attempt text parse as last resort
-        parsed = _parse_model_response_text(text)
-        return parsed
+        try:
+            resp = requests.post(
+                LLM_API_URL,
+                json=body,
+                headers=headers,
+                timeout=25
+            )
+        except Exception as e:
+            logger.warning(f"Attempt {attempt_idx}: network error contacting Gemini: {e}")
+            continue
 
-    # join parts to model_text
-    try:
+        status = resp.status_code
+        text = resp.text or ""
+
+        logger.info(f"Attempt {attempt_idx}: Gemini returned status={status}, len={len(text)}")
+
+        if status != 200:
+            logger.warning(f"Attempt {attempt_idx}: non-200 status: {status}, body={text[:400]}")
+            continue
+
+        # Try JSON decode
+        try:
+            data = resp.json()
+        except Exception:
+            logger.warning(f"Attempt {attempt_idx}: top-level JSON parse failed")
+            parsed = _parse_model_response_text(text)
+            if parsed:
+                logger.info(f"Attempt {attempt_idx}: parsed JSON from text")
+                return parsed
+            continue
+
+        # Parse candidate structure
+        candidates = data.get("candidates") or []
+        if not candidates:
+            logger.warning(f"Attempt {attempt_idx}: no candidates returned")
+            continue
+
         content = candidates[0].get("content", {}) or {}
         parts = content.get("parts") or []
+
         model_text = ""
         for p in parts:
             if isinstance(p, dict):
                 model_text += p.get("text", "")
             elif isinstance(p, str):
                 model_text += p
+
         parsed = _parse_model_response_text(model_text)
         if parsed:
+            logger.info(f"Attempt {attempt_idx}: parsed JSON from candidate parts")
             return parsed
-        # keyword fallback
-        lower = model_text.lower()
-        if "high risk" in lower or "high_risk" in lower:
-            return 0.9, "high_risk", model_text[:400]
-        if "medium" in lower:
-            return 0.5, "medium_risk", model_text[:400]
-        if "low" in lower:
-            return 0.1, "low_risk", model_text[:400]
-    except Exception as e:
-        logger.exception("Error processing LLM candidate content: %s", e)
-        return None
 
-    logger.debug("No usable result from LLM response.")
+        logger.warning(
+            f"Attempt {attempt_idx}: candidate had no parseable JSON; model_text={model_text[:400]}"
+        )
+
+    # --- All retries failed ---
+    logger.error("Gemini did not return valid JSON after 3 attempts — falling back")
     return None
 
 
