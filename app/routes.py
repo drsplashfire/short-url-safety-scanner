@@ -1,0 +1,46 @@
+# app/routes.py
+from flask import Blueprint, request, jsonify
+from .db import insert_scan, fetch_scans
+from .ai_client import call_safety
+from .fetcher import fetch_url
+import uuid
+
+bp = Blueprint('api', __name__)
+
+@bp.route('/scan', methods=['POST'])
+def scan_url():
+    payload = request.get_json(force=True)
+    url = (payload.get('url') or '').strip()
+    if not url:
+        return jsonify({'error': 'url required'}), 400
+
+    if not (url.startswith('http://') or url.startswith('https://')):
+        url = 'http://' + url
+
+    fetched = fetch_url(url)
+    if fetched.get('error'):
+        return jsonify({'error': fetched['error']}), 502
+
+    title = fetched.get('title', '')
+    page_text = fetched.get('text', '')
+
+    score, label, explanation = call_safety(url, page_text)
+
+    scan_id = str(uuid.uuid4())
+    insert_scan(scan_id, url, title, score, label, explanation)
+
+    return jsonify({
+        'id': scan_id,
+        'url': url,
+        'title': title,
+        'safety_score': score,
+        'label': label,
+        'explanation': explanation,
+        'timestamp': None
+    }), 201
+
+
+@bp.route('/scans', methods=['GET'])
+def list_scans():
+    items = fetch_scans(limit=100)
+    return jsonify(items)
